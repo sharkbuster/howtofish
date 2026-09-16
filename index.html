@@ -1,0 +1,1998 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>渔力全开 · 2D 致敬版</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; height: 100%; overflow: hidden;
+    background: #06070f;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  canvas { display: block; cursor: crosshair; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  /* ============================================================ 基础 */
+
+  var canvas = document.getElementById('game');
+  var ctx = canvas.getContext('2d', { alpha: false });
+
+  var LW = 1024, LH = 576;          // 逻辑分辨率
+  var W = 0, H = 0, DPR = 1;
+  var scale = 1, offX = 0, offY = 0;
+
+  var GROUND_Y = 392;               // 沙滩/码头地面高度 = 海平面
+  var SHORE_X  = 438;               // 沙滩右缘
+  var ESCAPE_X = 468;               // 鱼越过这里就落海逃跑
+  var PLAYER_MIN_X = 40, PLAYER_MAX_X = 418;
+
+  var MONO = 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
+
+  function resize() {
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+    W = window.innerWidth; H = window.innerHeight;
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    scale = Math.min(W / LW, H / LH);
+    offX = (W - LW * scale) / 2;
+    offY = (H - LH * scale) / 2;
+  }
+
+  function worldTransform() {
+    ctx.setTransform(DPR * scale, 0, 0, DPR * scale, DPR * offX, DPR * offY);
+  }
+  function screenTransform() {
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  }
+  function toWorld(cx, cy) {
+    return { x: (cx - offX) / scale, y: (cy - offY) / scale };
+  }
+
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function rand(a, b) { return a + Math.random() * (b - a); }
+  function pick(arr) { return arr[(Math.random() * arr.length) | 0]; }
+  function lerp(a, b, t) { return a + (b - a) * t; }
+
+  /* ============================================================ 音效 */
+
+  var actx = null, soundOn = true;
+
+  function audioInit() {
+    if (actx) return;
+    try {
+      var AC = window.AudioContext || window.webkitAudioContext;
+      if (AC) actx = new AC();
+    } catch (e) { actx = null; }
+  }
+
+  function blip(freq, dur, type, vol, slide) {
+    if (!soundOn || !actx) return;
+    try {
+      var t = actx.currentTime;
+      var o = actx.createOscillator(), g = actx.createGain();
+      o.type = type || 'square';
+      o.frequency.setValueAtTime(freq, t);
+      if (slide) o.frequency.exponentialRampToValueAtTime(Math.max(30, freq + slide), t + dur);
+      g.gain.setValueAtTime(vol, t);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+      o.connect(g); g.connect(actx.destination);
+      o.start(t); o.stop(t + dur + 0.02);
+    } catch (e) { /* ignore */ }
+  }
+
+  function noiseHit(vol) {
+    if (!soundOn || !actx) return;
+    try {
+      var t = actx.currentTime, len = Math.floor(actx.sampleRate * 0.14);
+      var buf = actx.createBuffer(1, len, actx.sampleRate);
+      var d = buf.getChannelData(0);
+      for (var i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / len);
+      var s = actx.createBufferSource(); s.buffer = buf;
+      var g = actx.createGain(); g.gain.value = vol || 0.08;
+      s.connect(g); g.connect(actx.destination); s.start(t);
+    } catch (e) { /* ignore */ }
+  }
+
+  /* ============================================================ 数据 */
+
+  var WEAPONS = [
+    { name: '拳头',   melee: true,  dmg: 1, cd: 0.30, range: 52,  arc: 1.15, cost: 0 },
+    { name: '指虎',   melee: true,  dmg: 2, cd: 0.24, range: 56,  arc: 1.25, cost: 160 },
+    { name: '砍刀',   melee: true,  dmg: 4, cd: 0.30, range: 66,  arc: 1.40, cost: 460 },
+    { name: '手枪',   melee: false, dmg: 2, cd: 0.26, speed: 900, jam: 0.03, cost: 1000 },
+    { name: '霰弹枪', melee: false, dmg: 2, cd: 0.62, speed: 840, pellets: 5, spread: 0.30, jam: 0.07, cost: 2000 },
+    { name: '狙击枪', melee: false, dmg: 9, cd: 1.00, speed: 1600, pierce: true, jam: 0.06, cost: 3600 }
+  ];
+
+  var FISH = [
+    { id: '沙丁鱼', size: 15, hp: 1,  value: 14,  weight: 26, hop: 1.00, reel: 1.0, struggle: 0.00, color: '#9fe8ff', touch: 0 },
+    { id: '鲭鱼',   size: 19, hp: 2,  value: 28,  weight: 22, hop: 1.15, reel: 1.10, struggle: 0.10, color: '#7fd4a8', touch: 0 },
+    { id: '石斑',   size: 25, hp: 3,  value: 52,  weight: 16, hop: 1.30, reel: 1.25, struggle: 0.18, color: '#ffd166', touch: 0 },
+    { id: '疯鲈',   size: 29, hp: 5,  value: 92,  weight: 11, hop: 1.50, reel: 1.55, struggle: 0.30, color: '#ff8a5c', touch: 0 },
+    { id: '河豚',   size: 33, hp: 7,  value: 165, weight: 6,  hop: 1.70, reel: 1.85, struggle: 0.42, color: '#ff5f9e', touch: 1 },
+    { id: '翻车鱼', size: 46, hp: 13, value: 360, weight: 2,  hop: 1.15, reel: 2.40, struggle: 0.52, color: '#b28cff', touch: 1 }
+  ];
+
+  // 每座岛的鱼群权重倍率（后面的岛大鱼更多）
+  var ISLANDS = [
+    {
+      name: '新手码头', goal: 8, boss: '蜘蛛蟹', bossHp: 70,
+      fishMul: [3.0, 2.2, 1.0, 0.35, 0.10, 0.00],
+      sky: ['#1a2a4a', '#2d4a6b'], sea: ['#0d2b45', '#061520'], sand: '#c8a878', ground: '#8a6f4a'
+    },
+    {
+      name: '鬼畜浅滩', goal: 12, boss: '大河豚', bossHp: 130,
+      fishMul: [1.0, 1.6, 1.6, 1.2, 0.55, 0.12],
+      sky: ['#3a1f4a', '#6b3a5a'], sea: ['#2a1040', '#100520'], sand: '#b09678', ground: '#7a5f4a'
+    },
+    {
+      name: '最终礁石', goal: 16, boss: '巨型海胆', bossHp: 210,
+      fishMul: [0.4, 0.9, 1.3, 1.5, 1.1, 0.5],
+      sky: ['#4a1a1a', '#7a3a20'], sea: ['#2a0a12', '#120308'], sand: '#9a8878', ground: '#6a5040'
+    }
+  ];
+
+  var SHOP = [
+    { key: '1', label: '指虎',       cost: 160,  kind: 'weapon', idx: 1 },
+    { key: '2', label: '砍刀',       cost: 460,  kind: 'weapon', idx: 2 },
+    { key: '3', label: '手枪',       cost: 1000, kind: 'weapon', idx: 3 },
+    { key: '4', label: '霰弹枪',     cost: 2000, kind: 'weapon', idx: 4 },
+    { key: '5', label: '狙击枪',     cost: 3600, kind: 'weapon', idx: 5 },
+    { key: '6', label: '鱼竿升级',   cost: 520,  kind: 'rod' },
+    { key: '7', label: '生命上限+1', cost: 900,  kind: 'hp' }
+  ];
+
+  var QUIPS = [
+    '这鱼有点不对劲…',
+    '斗疯鱼，其乐无穷。',
+    '钓鱼？不，是打架。',
+    '别让它蹦回海里！',
+    '枪卡壳是特色，不是 bug。',
+    '海鸥才是这游戏的真 BOSS。'
+  ];
+
+  /* ============================================================ 状态 */
+
+  var keys = Object.create(null);
+  var mouse = { x: LW / 2, y: 300, down: false };
+
+  var player = {
+    x: 150, y: GROUND_Y, vx: 0, w: 26, h: 48,
+    hp: 3, maxHp: 3, weapon: 0, rodLevel: 0,
+    money: 0, facing: 1,
+    attackCd: 0, attackAnim: 0, invuln: 0,
+    alive: true, deadTimer: 0, drunk: 0
+  };
+
+  var G = null;
+  var save = { unlocked: 0 };
+  try {
+    var raw = localStorage.getItem('howtofish.save');
+    if (raw) save = JSON.parse(raw);
+  } catch (e) { /* ignore */ }
+
+  function persist() {
+    try { localStorage.setItem('howtofish.save', JSON.stringify(save)); } catch (e) { /* ignore */ }
+  }
+
+  function newIsland(idx) {
+    var isl = ISLANDS[idx];
+    return {
+      idx: idx,
+      caught: 0,
+      goal: isl.goal,
+      fish: [],
+      bullets: [],
+      parts: [],
+      texts: [],
+      gulls: [],
+      eballs: [],
+      boss: null,
+      bossPending: false,
+      bossIntro: 0,
+      gullCd: rand(6, 12),
+      splashCd: 0
+    };
+  }
+
+  function newGame() {
+    G = {
+      mode: 'playing',
+      t: 0, shake: 0, flash: 0,
+      island: newIsland(0),
+      shopSel: 0,
+      jammed: 0,
+      msg: '',
+      msgT: 0,
+      quip: QUIPS[0],
+      quipT: 0,
+      clearT: 0,
+      totalCaught: 0,
+      deaths: 0
+    };
+    player.x = 150; player.y = GROUND_Y; player.vx = 0;
+    player.hp = 3; player.maxHp = 3;
+    player.weapon = 0; player.rodLevel = 0;
+    player.money = 0;
+    player.attackCd = 0; player.attackAnim = 0; player.invuln = 0;
+    player.alive = true; player.deadTimer = 0;
+    resetFishing();
+  }
+
+  function say(text, dur) {
+    G.msg = text;
+    G.msgT = dur || 2.2;
+  }
+
+  /* ============================================================ 钓鱼 */
+
+  var fish = {
+    state: 'idle',     // idle | charging | flying | waiting | bite | reeling | missed
+    power: 0,
+    bobber: { x: 0, y: 0, vx: 0, vy: 0 },
+    target: null,      // 咬钩的鱼种
+    tension: 0,
+    progress: 0,
+    t: 0,
+    waitT: 0,
+    shuffle: 0         // 水下靠近的鱼影
+  };
+
+  function resetFishing() {
+    fish.state = 'idle';
+    fish.power = 0;
+    fish.target = null;
+    fish.tension = 0;
+    fish.progress = 0;
+    fish.waitT = 0;
+  }
+
+  function pickFish() {
+    var isl = G.island;
+    var mul = ISLANDS[isl.idx].fishMul;
+    var total = 0, i;
+    for (i = 0; i < FISH.length; i++) total += FISH[i].weight * mul[i];
+    var r = Math.random() * total;
+    for (i = 0; i < FISH.length; i++) {
+      r -= FISH[i].weight * mul[i];
+      if (r <= 0) return FISH[i];
+    }
+    return FISH[0];
+  }
+
+  function updateFishing(dt) {
+    if (!player.alive) return;
+    var hold = !!keys[' '];
+
+    if (fish.state === 'idle') {
+      if (hold) { fish.state = 'charging'; fish.power = 0; }
+      return;
+    }
+
+    if (fish.state === 'charging') {
+      fish.power = Math.min(1, fish.power + dt * 1.15);
+      if (!hold) {
+        var p = fish.power;
+        var hand = rodHand();
+        fish.bobber.x = hand.x; fish.bobber.y = hand.y;
+        fish.bobber.vx = 150 + 620 * p;
+        fish.bobber.vy = -230;
+        fish.state = 'flying';
+        blip(300 + 300 * p, 0.09, 'sine', 0.04, 200);
+      }
+      return;
+    }
+
+    if (fish.state === 'flying') {
+      fish.bobber.vy += 900 * dt;
+      fish.bobber.x += fish.bobber.vx * dt;
+      fish.bobber.y += fish.bobber.vy * dt;
+      if (fish.bobber.y >= GROUND_Y) {
+        fish.bobber.y = GROUND_Y;
+        if (fish.bobber.x > ESCAPE_X) {
+          fish.state = 'waiting';
+          fish.waitT = rand(0.9, 3.2);
+          fish.shuffle = 0;
+          blip(520, 0.06, 'sine', 0.03, -120);
+        } else {
+          say('没抛到水里…', 1.4);
+          resetFishing();
+        }
+      }
+      if (fish.bobber.x > LW - 10) resetFishing();
+      return;
+    }
+
+    if (fish.state === 'waiting') {
+      fish.waitT -= dt;
+      fish.shuffle += dt;
+      if (fish.waitT <= 0) {
+        fish.target = pickFish();
+        fish.state = 'bite';
+        fish.tension = 0;
+        fish.progress = 0;
+        blip(880, 0.12, 'triangle', 0.06, 260);
+      }
+      if (hold) { resetFishing(); }   // 收竿
+      return;
+    }
+
+    if (fish.state === 'bite') {
+      if (hold) { fish.state = 'reeling'; fish.t = 0; }
+      return;
+    }
+
+    if (fish.state === 'reeling') {
+      var f = fish.target;
+      var rodBonus = 1 - player.rodLevel * 0.11;
+      if (hold) {
+        fish.tension += (0.60 + f.struggle) * rodBonus * dt;
+        fish.progress += (0.55 * (1 + player.rodLevel * 0.15) / f.reel) * dt;
+        if (fish.tension >= 1) {
+          fish.tension = 1;
+          say('断线了！它跑了！', 1.8);
+          noiseHit(0.05);
+          blip(200, 0.3, 'sawtooth', 0.05, -140);
+          resetFishing();
+          return;
+        }
+      } else {
+        fish.tension = Math.max(0, fish.tension - 1.15 * dt);
+        fish.progress = Math.max(0, fish.progress - 0.16 * dt);
+      }
+      if (fish.progress >= 1) {
+        landFish(f);
+        resetFishing();
+      }
+      return;
+    }
+  }
+
+  function rodHand() {
+    return { x: player.x + player.facing * 14, y: player.y - 34 };
+  }
+
+  // 钓上来的鱼飞上岸 —— 变成一只疯鱼
+  function landFish(f) {
+    var isl = G.island;
+    var dir = -1;                                     // 往沙滩方向飞
+    var fx = clamp(fish.bobber.x - 90 - Math.random() * 90, 90, PLAYER_MAX_X + 20);
+    isl.fish.push({
+      def: f, x: fx, y: GROUND_Y - 160,
+      vx: dir * rand(60, 150), vy: rand(-260, -120),
+      hp: f.hp, maxHp: f.hp, size: f.size,
+      onGround: false, ko: false, flash: 0, spin: rand(0, 6.28), rot: 0,
+      koT: 0, hopCd: 0, dir: 1, dazed: 0
+    });
+    blip(420, 0.18, 'triangle', 0.06, 380);
+    noiseHit(0.06);
+    say(pick(QUIPS), 2.0);
+  }
+
+  /* ============================================================ 上岸的鱼 */
+
+  function updateLandFish(dt) {
+    var isl = G.island, list = isl.fish;
+    for (var i = list.length - 1; i >= 0; i--) {
+      var o = list[i];
+      o.flash = Math.max(0, o.flash - dt * 6);
+      o.rot += o.spin * dt;
+
+      if (o.ko) {
+        o.koT += dt;
+        o.vx *= 1 - 4 * dt;
+        continue;
+      }
+
+      // 重力
+      o.vy += 1500 * dt;
+      o.x += o.vx * dt;
+      o.y += o.vy * dt;
+
+      // 撞地弹跳
+      if (o.y >= GROUND_Y - o.size * 0.5) {
+        o.y = GROUND_Y - o.size * 0.5;
+        if (o.vy > 60) {
+          o.vy = -o.vy * 0.5;
+          o.vx += 70 * o.def.hop;             // 每次弹跳都往海里挪
+          noiseHit(0.025);
+        } else {
+          o.vy = 0;
+          o.vx += 40 * o.dir * dt;
+        }
+        o.onGround = true;
+      } else {
+        o.onGround = false;
+      }
+
+      // 落地后持续朝海里蹦
+      o.hopCd -= dt;
+      if (o.hopCd <= 0 && o.y >= GROUND_Y - o.size * 0.6) {
+        o.hopCd = rand(0.28, 0.6) / o.def.hop;
+        o.vy = -rand(300, 430) * Math.min(1.5, o.def.hop);
+        o.vx = rand(60, 150) * o.def.hop;
+        o.spin = rand(-8, 8);
+      }
+
+      o.x = clamp(o.x, 30, LW);
+
+      // 蹦回海里 = 跑掉
+      if (o.x > ESCAPE_X) {
+        splash(o.x, GROUND_Y + 8);
+        isl.fish.splice(i, 1);
+        say('它蹦回海里了！', 1.5);
+        blip(260, 0.22, 'sine', 0.04, -150);
+        continue;
+      }
+
+      // 碰到玩家：大鱼撞人
+      if (o.def.touch > 0 && player.alive && player.invuln <= 0) {
+        if (Math.abs(o.x - player.x) < o.size * 0.5 + 16 && o.y > player.y - player.h) {
+          hurtPlayer(o.def.touch, o.x);
+        }
+      }
+    }
+  }
+
+  function hurtPlayer(dmg, fromX) {
+    if (!player.alive || player.invuln > 0) return;
+    player.hp -= dmg;
+    player.invuln = 1.6;
+    G.shake = Math.min(20, G.shake + 12);
+    G.flash = 0.35;
+    burst(player.x, player.y - 24, '#ff6b8a', 18, 260, 3);
+    blip(170, 0.22, 'sawtooth', 0.07, -110);
+    if (player.hp <= 0) {
+      player.hp = 0;
+      player.alive = false;
+      player.deadTimer = 1.4;
+      G.deaths++;
+      burst(player.x, player.y - 24, '#ffffff', 30, 380, 3.5);
+      G.shake = 24;
+      say('……醉了，睡了。', 1.6);
+    }
+  }
+
+  function splash(x, y) {
+    for (var i = 0; i < 16; i++) {
+      var a = rand(-Math.PI, 0);
+      var s = rand(60, 240);
+      G.island.parts.push({
+        x: x, y: y, vx: Math.cos(a) * s, vy: Math.sin(a) * s * 0.9,
+        life: 0, maxLife: rand(0.35, 0.7), color: '#bfe9ff', size: rand(1.5, 3.5), grav: 900
+      });
+    }
+  }
+
+  function burst(x, y, color, n, spd, size) {
+    for (var i = 0; i < n; i++) {
+      var a = rand(0, Math.PI * 2);
+      var s = spd * rand(0.25, 1.1);
+      G.island.parts.push({
+        x: x, y: y, vx: Math.cos(a) * s, vy: Math.sin(a) * s,
+        life: 0, maxLife: rand(0.3, 0.8), color: color, size: size * rand(0.5, 1.3), grav: 320
+      });
+    }
+  }
+
+  function floatText(x, y, text, color) {
+    G.island.texts.push({ x: x, y: y, text: text, color: color, life: 0, maxLife: 1.1 });
+  }
+
+  /* ============================================================ 攻击 */
+
+  function attack() {
+    if (!player.alive || player.attackCd > 0) return;
+    var wp = WEAPONS[player.weapon];
+
+    if (wp.jam && Math.random() < wp.jam) {
+      G.jammed = 0.55;
+      say('卡壳了！按 R', 1.2);
+      blip(120, 0.18, 'square', 0.05, -60);
+      player.attackCd = 0.35;
+      return;
+    }
+
+    var hand = rodHand();
+    var ang = Math.atan2(mouse.y - hand.y, mouse.x - hand.x);
+    player.facing = mouse.x >= player.x ? 1 : -1;
+    player.attackCd = wp.cd;
+    player.attackAnim = 0.16;
+
+    if (wp.melee) {
+      var cx = player.x + Math.cos(ang) * wp.range * 0.6;
+      var cy = player.y - 30 + Math.sin(ang) * wp.range * 0.6;
+      var list = G.island.fish;
+      var hitAny = false;
+      for (var i = 0; i < list.length; i++) {
+        var o = list[i];
+        if (o.ko) continue;
+        var dx = o.x - cx, dy = (o.y) - cy;
+        if (dx * dx + dy * dy < (wp.range * 0.62 + o.size * 0.5) * (wp.range * 0.62 + o.size * 0.5)) {
+          damageFish(o, wp.dmg);
+          hitAny = true;
+        }
+      }
+      if (damageBossIn(cx, cy, wp.range * 0.62, wp.dmg)) hitAny = true;
+      for (var g = G.island.gulls.length - 1; g >= 0; g--) {
+        var gu = G.island.gulls[g];
+        var gx = gu.x - cx, gy = gu.y - cy;
+        if (gx * gx + gy * gy < (wp.range * 0.7) * (wp.range * 0.7)) { damageGull(gu, wp.dmg); hitAny = true; }
+      }
+      blip(hitAny ? 520 : 260, 0.06, 'square', 0.04, hitAny ? -200 : -60);
+      noiseHit(hitAny ? 0.05 : 0.02);
+      if (hitAny) G.shake = Math.min(14, G.shake + 4);
+    } else {
+      var n = wp.pellets || 1;
+      for (var p = 0; p < n; p++) {
+        var a2 = ang + (n > 1 ? (p / (n - 1) - 0.5) * wp.spread : 0) + rand(-0.02, 0.02);
+        G.island.bullets.push({
+          x: hand.x, y: hand.y,
+          vx: Math.cos(a2) * wp.speed, vy: Math.sin(a2) * wp.speed,
+          dmg: wp.dmg, pierce: !!wp.pierce, r: wp.pierce ? 4 : 3, life: 1.4
+        });
+      }
+      burst(hand.x, hand.y, '#ffd98a', 6, 220, 2);
+      blip(140, 0.08, 'square', 0.05, -90);
+      noiseHit(0.07);
+      G.shake = Math.min(16, G.shake + 5);
+    }
+  }
+
+  function damageFish(o, dmg) {
+    o.hp -= dmg;
+    o.flash = 1;
+    burst(o.x, o.y, o.def.color, 6, 200, 2.4);
+    blip(600, 0.04, 'square', 0.03, -220);
+    if (o.hp <= 0) {
+      o.ko = true;
+      o.koT = 0;
+      o.vx *= 0.3;
+      o.spin = 0;
+      floatText(o.x, o.y - o.size, '晕了', '#ffe9a0');
+      blip(300, 0.16, 'triangle', 0.05, 220);
+    }
+  }
+
+  function damageBossIn(x, y, r, dmg) {
+    var b = G.island.boss;
+    if (!b || b.dead || b.spawnT > 0) return false;
+    var dx = b.x - x, dy = (b.y - b.h * 0.5) - y;
+    var rr = r + b.w * 0.45;
+    if (dx * dx + dy * dy < rr * rr) { damageBoss(dmg); return true; }
+    return false;
+  }
+
+  function damageGull(gu, dmg) {
+    gu.hp -= dmg;
+    gu.flash = 1;
+    burst(gu.x, gu.y, '#ffffff', 6, 180, 2);
+    if (gu.hp <= 0) {
+      if (gu.carry) {
+        gu.carry.x = gu.x; gu.carry.y = gu.y; gu.carry.vy = -60; gu.carry.vx = rand(-60, 60);
+        G.island.fish.push(gu.carry);
+        gu.carry = null;
+        say('鱼掉下来了！', 1.2);
+      }
+      burst(gu.x, gu.y, '#ffffff', 20, 280, 3);
+      G.island.gulls.splice(G.island.gulls.indexOf(gu), 1);
+      player.money += 25;
+      floatText(gu.x, gu.y, '+¥25', '#ffe066');
+      blip(700, 0.14, 'triangle', 0.05, -300);
+    }
+  }
+
+  /* ============================================================ 子弹 */
+
+  function updateBullets(dt) {
+    var isl = G.island;
+    var list = isl.bullets;
+
+    for (var i = list.length - 1; i >= 0; i--) {
+      var b = list[i];
+      b.life -= dt;
+      if (b.life <= 0) { list.splice(i, 1); continue; }
+
+      // 子弹很快：切成小步推进，否则一帧跨过整条鱼（穿模）
+      var travel = Math.hypot(b.vx, b.vy) * dt;
+      var steps = Math.max(1, Math.ceil(travel / 7));
+      var sdx = b.vx * dt / steps, sdy = b.vy * dt / steps;
+      var gone = false;
+
+      for (var s = 0; s < steps; s++) {
+        b.x += sdx; b.y += sdy;
+
+        if (b.x < -20 || b.x > LW + 20 || b.y < -20 || b.y > LH + 20) {
+          list.splice(i, 1); gone = true; break;
+        }
+
+        var j, o, dx, dy, rr;
+        var fs = isl.fish;
+        for (j = 0; j < fs.length; j++) {
+          o = fs[j];
+          if (o.ko) continue;
+          if (b.hits && b.hits.indexOf(o) !== -1) continue;
+          dx = o.x - b.x; dy = o.y - b.y;
+          rr = b.r + o.size * 0.55;
+          if (dx * dx + dy * dy < rr * rr) {
+            damageFish(o, b.dmg);
+            if (!b.pierce) { list.splice(i, 1); gone = true; }
+            else { (b.hits || (b.hits = [])).push(o); }
+            break;                       // 一步只结算一个目标
+          }
+        }
+        if (gone) break;
+
+        var bs = isl.boss;
+        if (bs && !bs.dead && bs.spawnT <= 0 && !(b.hits && b.hits.indexOf(bs) !== -1)) {
+          var bx = bs.x - b.x, by = (bs.y - bs.h * 0.5) - b.y;
+          if (Math.abs(bx) < bs.w * 0.5 + b.r && Math.abs(by) < bs.h * 0.5 + b.r) {
+            damageBoss(b.dmg);
+            burst(b.x, b.y, '#ffd0e0', 5, 160, 2);
+            if (!b.pierce) { list.splice(i, 1); gone = true; break; }
+            (b.hits || (b.hits = [])).push(bs);
+          }
+        }
+
+        var gs = isl.gulls;
+        for (var k = gs.length - 1; k >= 0; k--) {
+          var gu = gs[k];
+          if (b.hits && b.hits.indexOf(gu) !== -1) continue;
+          var gx = gu.x - b.x, gy = gu.y - b.y;
+          if (gx * gx + gy * gy < 24 * 24) {
+            damageGull(gu, b.dmg);
+            if (!b.pierce) { list.splice(i, 1); gone = true; break; }
+            (b.hits || (b.hits = [])).push(gu);
+          }
+        }
+        if (gone) break;
+      }
+    }
+  }
+
+  /* ============================================================ 海鸥 */
+
+  function updateGulls(dt) {
+    var isl = G.island;
+    isl.gullCd -= dt;
+    if (isl.gullCd <= 0) {
+      isl.gullCd = rand(9, 16);
+      var fromLeft = Math.random() < 0.5;
+      isl.gulls.push({
+        x: fromLeft ? -40 : LW + 40,
+        y: rand(70, 190),
+        vx: fromLeft ? 130 : -130,
+        vy: 0, hp: 2, flash: 0, carry: null,
+        wing: rand(0, 6.28), state: 'cruise', target: null
+      });
+      say('海鸥来了 ——', 1.6);
+    }
+
+    for (var i = isl.gulls.length - 1; i >= 0; i--) {
+      var gu = isl.gulls[i];
+      gu.flash = Math.max(0, gu.flash - dt * 5);
+      gu.wing += dt * 9;
+
+      if (!gu.carry) {
+        // 找一条晕了的鱼
+        var best = null, bestD = 1e9;
+        for (var j = 0; j < isl.fish.length; j++) {
+          var o = isl.fish[j];
+          if (!o.ko) continue;
+          var d = Math.abs(o.x - gu.x) + Math.abs(o.y - gu.y) * 0.4;
+          if (d < bestD) { bestD = d; best = o; }
+        }
+        if (best) {
+          gu.state = 'dive';
+          gu.target = best;
+          var ang = Math.atan2(best.y - gu.y, best.x - gu.x);
+          var sp = 210;
+          gu.vx = Math.cos(ang) * sp;
+          gu.vy = Math.sin(ang) * sp;
+        } else if (gu.state === 'dive') {
+          gu.state = 'cruise';
+          gu.target = null;
+        }
+      }
+
+      if (gu.state === 'cruise' && !gu.carry) {
+        gu.vy = Math.sin(G.t * 2 + gu.wing) * 14;
+      }
+
+      gu.x += gu.vx * dt;
+      gu.y += gu.vy * dt;
+      gu.y = clamp(gu.y, 40, GROUND_Y - 20);
+
+      // 抓到鱼
+      if (gu.target && !gu.carry) {
+        var o2 = gu.target;
+        if (isl.fish.indexOf(o2) === -1) { gu.target = null; gu.state = 'cruise'; }
+        else if (Math.abs(o2.x - gu.x) < 22 && Math.abs(o2.y - gu.y) < 26) {
+          isl.fish.splice(isl.fish.indexOf(o2), 1);
+          gu.carry = o2;
+          gu.state = 'flee';
+          gu.vx = gu.vx > 0 ? 190 : -190;
+          gu.vy = -120;
+          say('海鸥抢走了你的鱼！！', 2.0);
+          blip(900, 0.2, 'triangle', 0.05, -400);
+        }
+      }
+
+      if (gu.carry) {
+        gu.vy = -60;
+        gu.vx = gu.x < LW / 2 ? -190 : 190;
+        if (gu.carry) { gu.carry.x = gu.x; gu.carry.y = gu.y + 16; }
+      }
+
+      if (gu.x < -80 || gu.x > LW + 80 || gu.y < -80) {
+        if (gu.carry) say('鱼没了。', 1.4);
+        isl.gulls.splice(i, 1);
+      }
+    }
+  }
+
+  /* ============================================================ BOSS */
+
+  var BOSS_STYLE = {
+    '蜘蛛蟹':  { color: '#ff5f5f', accent: '#ffb0b0', legs: true },
+    '大河豚':  { color: '#ff5f9e', accent: '#ffd0e0', spikes: true },
+    '巨型海胆': { color: '#8a5fff', accent: '#d0c0ff', spikes: true }
+  };
+
+  function spawnBoss() {
+    var isl = G.island;
+    var cfg = ISLANDS[isl.idx];
+    isl.boss = {
+      name: cfg.boss,
+      x: 760, y: GROUND_Y, w: 150, h: 130,
+      hp: cfg.bossHp, maxHp: cfg.bossHp,
+      vx: 0, vy: 0, dir: -1,
+      spawnT: 1.6, flash: 0, dead: false,
+      cd: 2.2, phase: 'idle', phaseT: 0, hopCd: 2,
+      rot: 0, deadT: 0
+    };
+    isl.bossIntro = 2.4;
+    G.shake = 20;
+    G.flash = 0.4;
+    say('警报：' + cfg.boss + ' 上岸了！', 3.0);
+    blip(80, 0.7, 'sawtooth', 0.07, 70);
+    noiseHit(0.1);
+  }
+
+  function damageBoss(dmg) {
+    var b = G.island.boss;
+    var isl = G.island;
+    if (!b || b.dead) return;
+    b.hp -= dmg;
+    b.flash = 1;
+    burst(b.x + rand(-30, 30), b.y - b.h * 0.5, '#ffd0e0', 7, 220, 2.6);
+    blip(420, 0.05, 'square', 0.03, -180);
+    if (b.hp <= 0) {
+      b.hp = 0;
+      b.dead = true;
+      b.deadT = 0;
+      G.shake = 26;
+      G.flash = 0.6;
+      burst(b.x, b.y - b.h * 0.5, '#ffffff', 60, 460, 4);
+      burst(b.x, b.y - b.h * 0.5, '#ffd0e0', 40, 320, 3.5);
+      noiseHit(0.14);
+      blip(110, 0.8, 'sawtooth', 0.08, -80);
+      player.money += 800 + isl.idx * 600;
+      floatText(b.x, b.y - b.h - 20, '+¥' + (800 + isl.idx * 600), '#ffe066');
+      // 掉一地鱼 —— 必须落在沙滩上（ESCAPE_X 以内），否则会直接算逃跑
+      for (var i = 0; i < 4; i++) {
+        var f = FISH[Math.min(FISH.length - 1, 2 + isl.idx + (i % 3))];
+        G.island.fish.push({
+          def: f,
+          x: rand(180, 420), y: GROUND_Y - 190 - i * 26,
+          vx: rand(-150, -40), vy: rand(-300, -160),
+          hp: f.hp, maxHp: f.hp, size: f.size,
+          onGround: false, ko: false, flash: 0, spin: rand(-6, 6), rot: 0,
+          koT: 0, hopCd: 0, dir: 1, dazed: 0
+        });
+      }
+    }
+  }
+
+  function updateBoss(dt) {
+    var b = G.island.boss;
+    if (!b) return;
+    b.flash = Math.max(0, b.flash - dt * 5);
+    b.rot += dt;
+
+    if (b.dead) {
+      b.deadT += dt;
+      if (b.deadT > 1.2) {
+        G.island.boss = null;
+        G.mode = 'islandClear';
+        G.clearT = 0;
+        save.unlocked = Math.max(save.unlocked, G.island.idx + 1);
+        persist();
+      }
+      return;
+    }
+
+    if (b.spawnT > 0) { b.spawnT -= dt; return; }
+
+    b.cd -= dt;
+    b.phaseT -= dt;
+
+    if (b.phase === 'idle') {
+      // 左右游走
+      b.x += b.dir * 60 * dt;
+      if (b.x < 620) { b.x = 620; b.dir = 1; }
+      if (b.x > 900) { b.x = 900; b.dir = -1; }
+      if (b.cd <= 0) {
+        var r = Math.random();
+        if (r < 0.4) { b.phase = 'charge'; b.phaseT = 0.7; b.vx = -420; }
+        else if (r < 0.72) { b.phase = 'spit'; b.phaseT = 0.45; b.shots = 0; }
+        else { b.phase = 'slam'; b.phaseT = 0.55; }
+        b.cd = rand(1.6, 2.8);
+      }
+    } else if (b.phase === 'charge') {
+      if (b.phaseT > 0) {
+        b.x += 40 * dt;                   // 蓄力后退
+      } else {
+        b.x += b.vx * dt;
+        if (b.x < 540) { b.x = 540; b.phase = 'idle'; b.vx = 0; }
+        // 撞到玩家
+        if (player.alive && player.invuln <= 0 &&
+            Math.abs(player.x - b.x) < b.w * 0.5 + 16 && player.y > b.y - b.h) {
+          hurtPlayer(1, b.x);
+        }
+      }
+    } else if (b.phase === 'spit') {
+      if (b.phaseT <= 0) {
+        b.shots++;
+        var ang = Math.atan2((player.y - 30) - (b.y - b.h * 0.5), player.x - b.x);
+        var sp = 260;
+        G.island.eballs.push({ x: b.x, y: b.y - b.h * 0.6, vx: Math.cos(ang) * sp, vy: Math.sin(ang) * sp, r: 9, life: 3 });
+        blip(300, 0.07, 'sawtooth', 0.035, -100);
+        b.phaseT = 0.22;
+        if (b.shots >= 3) { b.phase = 'idle'; }
+      }
+    } else if (b.phase === 'slam') {
+      if (b.phaseT <= 0) {
+        b.phase = 'idle';
+        G.shake = Math.min(24, G.shake + 16);
+        noiseHit(0.1);
+        for (var i = 0; i < 3; i++) {
+          G.island.eballs.push({
+            x: b.x + (i - 1) * 40, y: b.y - 20,
+            vx: (i - 1) * 130, vy: -300, r: 9, life: 3, grav: true
+          });
+        }
+        // 震地伤害近距离玩家
+        if (player.alive && player.invuln <= 0 && Math.abs(player.x - b.x) < 120) hurtPlayer(1, b.x);
+      }
+    }
+  }
+
+  function updateEBalls(dt) {
+    var list = G.island.eballs;
+    for (var i = list.length - 1; i >= 0; i--) {
+      var e = list[i];
+      if (e.grav) e.vy += 900 * dt;
+      e.x += e.vx * dt; e.y += e.vy * dt;
+      e.life -= dt;
+      if (e.life <= 0 || e.y > LH + 30 || e.x < -30 || e.x > LW + 30) { list.splice(i, 1); continue; }
+      if (player.alive && player.invuln <= 0) {
+        var dx = e.x - player.x, dy = e.y - (player.y - 26);
+        if (dx * dx + dy * dy < (e.r + 16) * (e.r + 16)) {
+          list.splice(i, 1);
+          hurtPlayer(1, e.x);
+        }
+      }
+    }
+  }
+
+  /* ============================================================ 玩家 */
+
+  function updatePlayer(dt) {
+    if (!player.alive) {
+      player.deadTimer -= dt;
+      if (player.deadTimer <= 0) {
+        player.alive = true;
+        player.hp = player.maxHp;
+        player.x = 120;
+        player.vx = 0;
+        player.invuln = 2.2;
+        say('……醒了。继续。', 1.6);
+        resetFishing();
+      }
+      return;
+    }
+
+    var ax = 0;
+    if (keys['a'] || keys['arrowleft']) ax -= 1;
+    if (keys['d'] || keys['arrowright']) ax += 1;
+    var speed = 250;
+    if (ax !== 0) {
+      player.vx += ax * 2200 * dt;
+      player.vx = clamp(player.vx, -speed, speed);
+      player.facing = ax;
+    } else {
+      player.vx *= 1 - 12 * dt;
+    }
+    player.x += player.vx * dt;
+    player.x = clamp(player.x, PLAYER_MIN_X, PLAYER_MAX_X);
+
+    player.y = GROUND_Y;
+    player.invuln = Math.max(0, player.invuln - dt);
+    player.attackCd = Math.max(0, player.attackCd - dt);
+    player.attackAnim = Math.max(0, player.attackAnim - dt);
+    player.drunk = Math.sin(G.t * 1.7) * 1.5;
+
+    if (G.jammed > 0) {
+      G.jammed -= dt;
+      if (keys['r']) { G.jammed = 0; say('上膛！', 0.8); blip(500, 0.08, 'square', 0.04, 200); }
+    }
+  }
+
+  /* ============================================================ 商店 */
+
+  function tryBuy(item) {
+    if (item.kind === 'weapon') {
+      if (player.weapon >= item.idx) { say('你已经有更好的了。', 1.4); return; }
+      if (player.money < item.cost) { say('钱不够。去钓。', 1.4); blip(200, 0.1, 'square', 0.04, -60); return; }
+      player.money -= item.cost;
+      player.weapon = item.idx;
+      say('装备了 ' + WEAPONS[item.idx].name + '！', 1.6);
+      blip(700, 0.14, 'triangle', 0.05, 400);
+    } else if (item.kind === 'rod') {
+      if (player.rodLevel >= 3) { say('鱼竿满级了。', 1.4); return; }
+      if (player.money < item.cost) { say('钱不够。去钓。', 1.4); blip(200, 0.1, 'square', 0.04, -60); return; }
+      player.money -= item.cost;
+      player.rodLevel++;
+      say('鱼竿 Lv.' + player.rodLevel + ' —— 不易断线了。', 1.8);
+      blip(760, 0.14, 'triangle', 0.05, 380);
+    } else if (item.kind === 'hp') {
+      if (player.maxHp >= 6) { say('身体到极限了。', 1.4); return; }
+      if (player.money < item.cost) { say('钱不够。去钓。', 1.4); blip(200, 0.1, 'square', 0.04, -60); return; }
+      player.money -= item.cost;
+      player.maxHp++;
+      player.hp = player.maxHp;
+      say('生命上限 ' + player.maxHp + '。', 1.6);
+      blip(640, 0.16, 'sine', 0.05, 300);
+    }
+  }
+
+  /* ============================================================ 收集 */
+
+  function collectFish(o) {
+    player.money += o.def.value;
+    G.island.caught++;
+    G.totalCaught++;
+    floatText(o.x, o.y - 18, '+¥' + o.def.value, '#ffe066');
+    blip(880, 0.07, 'triangle', 0.045, 300);
+    if (G.island.caught === G.island.goal && !G.island.boss) {
+      G.island.bossPending = true;
+    }
+  }
+
+  function updateCollect() {
+    if (!player.alive) return;
+    var list = G.island.fish;
+    for (var i = list.length - 1; i >= 0; i--) {
+      var o = list[i];
+      if (!o.ko) continue;
+      if (Math.abs(o.x - player.x) < 42 && Math.abs(o.y - player.y) < 76) {
+        collectFish(o);
+        burst(o.x, o.y, '#ffe066', 10, 180, 2.4);
+        list.splice(i, 1);
+      }
+    }
+  }
+
+  /* ============================================================ 特效 */
+
+  function updateParts(dt) {
+    var list = G.island.parts;
+    for (var i = list.length - 1; i >= 0; i--) {
+      var p = list[i];
+      p.life += dt;
+      if (p.life >= p.maxLife) { list.splice(i, 1); continue; }
+      p.vy += (p.grav || 0) * dt;
+      p.x += p.vx * dt; p.y += p.vy * dt;
+      p.vx *= 1 - 1.6 * dt;
+    }
+    var ts = G.island.texts;
+    for (var j = ts.length - 1; j >= 0; j--) {
+      ts[j].life += dt;
+      ts[j].y -= 26 * dt;
+      if (ts[j].life >= ts[j].maxLife) ts.splice(j, 1);
+    }
+  }
+
+  /* ============================================================ 更新 */
+
+  function update(dt) {
+    G.t += dt;
+    G.shake = Math.max(0, G.shake - dt * 46);
+    G.flash = Math.max(0, G.flash - dt * 2.2);
+    G.msgT = Math.max(0, G.msgT - dt);
+    G.quipT -= dt;
+    if (G.quipT <= 0) { G.quipT = rand(14, 24); G.quip = pick(QUIPS); }
+
+    updateParts(dt);
+    if (G.mode !== 'playing') { G.clearT += dt; return; }
+
+    updatePlayer(dt);
+    updateFishing(dt);
+    updateLandFish(dt);
+    updateBullets(dt);
+    updateGulls(dt);
+    updateBoss(dt);
+    updateEBalls(dt);
+    updateCollect();
+
+    var isl = G.island;
+    if (isl.bossPending && !isl.boss) {
+      isl.bossPending = false;
+      spawnBoss();
+    }
+    if (isl.bossIntro > 0) isl.bossIntro -= dt;
+  }
+
+  /* ============================================================ 绘制 */
+
+  function roundRect(x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+
+  function drawBackground() {
+    var cfg = ISLANDS[G.island.idx];
+    var g = ctx.createLinearGradient(0, 0, 0, GROUND_Y);
+    g.addColorStop(0, cfg.sky[0]);
+    g.addColorStop(1, cfg.sky[1]);
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, LW, GROUND_Y);
+
+    // 远山
+    ctx.fillStyle = 'rgba(0,0,0,0.22)';
+    ctx.beginPath();
+    ctx.moveTo(0, GROUND_Y);
+    ctx.lineTo(120, 250);
+    ctx.lineTo(240, GROUND_Y);
+    ctx.closePath();
+    ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(180, GROUND_Y);
+    ctx.lineTo(330, 210);
+    ctx.lineTo(470, GROUND_Y);
+    ctx.closePath();
+    ctx.fill();
+
+    // 海
+    var sg = ctx.createLinearGradient(0, GROUND_Y, 0, LH);
+    sg.addColorStop(0, cfg.sea[0]);
+    sg.addColorStop(1, cfg.sea[1]);
+    ctx.fillStyle = sg;
+    ctx.fillRect(0, GROUND_Y, LW, LH - GROUND_Y);
+
+    // 波纹
+    ctx.strokeStyle = 'rgba(255,255,255,0.13)';
+    ctx.lineWidth = 2;
+    for (var i = 0; i < 5; i++) {
+      var y = GROUND_Y + 22 + i * 34;
+      ctx.beginPath();
+      for (var x = 440; x < LW; x += 12) {
+        var yy = y + Math.sin((x * 0.03) + G.t * (1.2 + i * 0.25)) * 3;
+        if (x === 440) ctx.moveTo(x, yy); else ctx.lineTo(x, yy);
+      }
+      ctx.stroke();
+    }
+
+    // 沙滩
+    ctx.fillStyle = cfg.sand;
+    ctx.beginPath();
+    ctx.moveTo(0, GROUND_Y);
+    ctx.lineTo(SHORE_X, GROUND_Y);
+    ctx.quadraticCurveTo(SHORE_X + 46, GROUND_Y + 60, SHORE_X + 16, LH);
+    ctx.lineTo(0, LH);
+    ctx.closePath();
+    ctx.fill();
+
+    ctx.fillStyle = cfg.ground;
+    ctx.beginPath();
+    ctx.moveTo(0, GROUND_Y);
+    ctx.lineTo(SHORE_X, GROUND_Y);
+    ctx.lineTo(SHORE_X, GROUND_Y + 12);
+    ctx.lineTo(0, GROUND_Y + 12);
+    ctx.closePath();
+    ctx.fill();
+
+    // 水面亮线
+    ctx.strokeStyle = 'rgba(255,255,255,0.35)';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(SHORE_X - 10, GROUND_Y);
+    ctx.lineTo(LW, GROUND_Y);
+    ctx.stroke();
+
+    // 码头木板
+    ctx.strokeStyle = 'rgba(60,40,25,0.45)';
+    ctx.lineWidth = 2;
+    for (var px = 30; px < SHORE_X; px += 52) {
+      ctx.beginPath();
+      ctx.moveTo(px, GROUND_Y);
+      ctx.lineTo(px - 8, LH);
+      ctx.stroke();
+    }
+  }
+
+  function drawUnderwaterFish() {
+    // 水下游动的鱼影（纯装饰）
+    for (var i = 0; i < 7; i++) {
+      var t = G.t * (0.25 + i * 0.05) + i * 2.1;
+      var x = SHORE_X + 60 + ((t * 60) % (LW - SHORE_X - 40));
+      var y = GROUND_Y + 40 + (i % 4) * 32 + Math.sin(t * 1.5) * 6;
+      ctx.globalAlpha = 0.22;
+      ctx.fillStyle = '#7fd8ff';
+      ctx.beginPath();
+      ctx.ellipse(x, y, 13, 5, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.beginPath();
+      ctx.moveTo(x - 13, y);
+      ctx.lineTo(x - 21, y - 5);
+      ctx.lineTo(x - 21, y + 5);
+      ctx.closePath();
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  function drawFishingLine() {
+    if (fish.state === 'idle' || fish.state === 'charging') {
+      // 举着竿
+      var h = rodHand();
+      ctx.strokeStyle = '#c8a06a';
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.moveTo(h.x, h.y);
+      ctx.quadraticCurveTo(h.x + player.facing * 40, h.y - 50, h.x + player.facing * 70, h.y - 90);
+      ctx.stroke();
+      return;
+    }
+
+    var hand = rodHand();
+    var b = fish.bobber;
+
+    // 竿身：张力越高弯得越狠（竿会弯）
+    var tension = (fish.state === 'reeling') ? fish.tension : 0;
+    var mx = (hand.x + b.x) / 2;
+    var my = (hand.y + b.y) / 2;
+    var dx = b.x - hand.x, dy = b.y - hand.y;
+    var len = Math.hypot(dx, dy) || 1;
+    var bend = 26 + tension * 46;
+    var cxp = mx - (dy / len) * bend;
+    var cyp = my + (dx / len) * bend;
+
+    ctx.strokeStyle = '#d8b078';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(hand.x, hand.y);
+    ctx.quadraticCurveTo(cxp, cyp, b.x, b.y);
+    ctx.stroke();
+
+    // 线
+    ctx.strokeStyle = tension > 0.8 ? '#ff5f6d' : 'rgba(255,255,255,0.75)';
+    ctx.lineWidth = 1.4;
+    ctx.beginPath();
+    ctx.moveTo(hand.x, hand.y);
+    ctx.quadraticCurveTo(cxp, cyp, b.x, b.y);
+    ctx.stroke();
+
+    // 浮标
+    var bobY = b.y + Math.sin(G.t * 4) * 2;
+    ctx.fillStyle = fish.state === 'bite' ? '#ff3b5c' : '#ff5f5f';
+    ctx.beginPath(); ctx.arc(b.x, bobY - 4, 6, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = '#ffffff';
+    ctx.beginPath(); ctx.arc(b.x, bobY + 3, 5, 0, Math.PI * 2); ctx.fill();
+
+    if (fish.state === 'bite') {
+      var pulse = 1 + Math.sin(G.t * 12) * 0.18;
+      ctx.save();
+      ctx.translate(b.x, bobY - 34);
+      ctx.scale(pulse, pulse);
+      ctx.fillStyle = '#ffe066';
+      ctx.font = 'bold 30px ' + MONO;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('!', 0, 0);
+      ctx.restore();
+    }
+  }
+
+  function drawPlayer() {
+    var px = player.x, py = player.y;
+    var blink = player.invuln > 0 && Math.floor(player.invuln * 14) % 2 === 0;
+
+    if (!player.alive) {
+      ctx.save();
+      ctx.translate(px, py);
+      ctx.rotate(Math.PI / 2 * (1 - Math.max(0, player.deadTimer) / 1.4));
+      ctx.globalAlpha = 0.7;
+      ctx.fillStyle = '#e8c9a0';
+      roundRect(-13, -46, 26, 46, 8);
+      ctx.fill();
+      ctx.restore();
+      return;
+    }
+
+    ctx.save();
+    ctx.translate(px, py + player.drunk);
+    ctx.globalAlpha = blink ? 0.35 : 1;
+    ctx.scale(player.facing, 1);      // 整体镜像，武器/眼睛自动朝向
+
+    // 影子
+    ctx.fillStyle = 'rgba(0,0,0,0.28)';
+    ctx.beginPath();
+    ctx.ellipse(0, 2, 18, 5, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    // 腿
+    ctx.fillStyle = '#3a4a6a';
+    ctx.fillRect(-9, -20, 8, 20);
+    ctx.fillRect(1, -20, 8, 20);
+
+    // 身体
+    ctx.fillStyle = '#e07a4a';
+    roundRect(-13, -46, 26, 28, 8);
+    ctx.fill();
+
+    // 头
+    ctx.fillStyle = '#e8c9a0';
+    ctx.beginPath();
+    ctx.arc(0, -56, 11, 0, Math.PI * 2);
+    ctx.fill();
+
+    // 帽子
+    ctx.fillStyle = '#2f3a55';
+    ctx.beginPath();
+    ctx.arc(0, -60, 12, Math.PI, 0);
+    ctx.fill();
+    ctx.fillRect(-16, -61, 32, 4);
+
+    // 眼睛（朝向）
+    ctx.fillStyle = '#1a1a22';
+    ctx.beginPath();
+    ctx.arc(4, -55, 2.2, 0, Math.PI * 2);
+    ctx.fill();
+
+    // 武器
+    drawWeapon();
+
+    ctx.restore();
+  }
+
+  function drawWeapon() {
+    var wp = WEAPONS[player.weapon];
+    var hx = 14, hy = -34;            // 本地空间：+x 就是面朝方向
+    var hand = rodHand();
+    var ang = Math.atan2(mouse.y - hand.y, mouse.x - hand.x);
+    if (player.facing < 0) ang = Math.PI - ang;   // 抵消 scale(-1,1) 的镜像
+
+    ctx.save();
+    ctx.translate(hx, hy);
+    ctx.rotate(ang);
+
+    if (player.attackAnim > 0) {
+      var k = 1 - player.attackAnim / 0.16;
+      ctx.translate(k * (wp.melee ? 16 : -4), 0);
+      ctx.rotate(wp.melee ? -0.5 * (1 - k) : 0);
+    }
+
+    if (wp.melee) {
+      // 手臂
+      ctx.strokeStyle = '#e8c9a0';
+      ctx.lineWidth = 7;
+      ctx.lineCap = 'round';
+      ctx.beginPath();
+      ctx.moveTo(0, 0);
+      ctx.lineTo(18, 0);
+      ctx.stroke();
+
+      if (player.weapon === 0) {
+        ctx.fillStyle = '#e8c9a0';
+        ctx.beginPath(); ctx.arc(22, 0, 7, 0, Math.PI * 2); ctx.fill();
+      } else if (player.weapon === 1) {
+        ctx.fillStyle = '#b8c4d4';
+        ctx.beginPath(); ctx.arc(23, 0, 8, 0, Math.PI * 2); ctx.fill();
+      } else {
+        ctx.fillStyle = '#d8dce8';
+        ctx.beginPath();
+        ctx.moveTo(16, -3); ctx.lineTo(44, -6); ctx.lineTo(46, 0); ctx.lineTo(44, 4); ctx.lineTo(16, 3);
+        ctx.closePath(); ctx.fill();
+      }
+    } else {
+      var barrel = player.weapon === 3 ? 20 : (player.weapon === 4 ? 30 : 40);
+      ctx.fillStyle = '#3a3f4d';
+      ctx.fillRect(-4, -5, barrel, 10);
+      ctx.fillStyle = '#5a6273';
+      ctx.fillRect(-2, -3, barrel - 4, 4);
+      ctx.fillStyle = '#8a6a4a';
+      ctx.fillRect(-12, -3, 10, 9);
+      if (player.attackAnim > 0.09) {
+        ctx.fillStyle = '#ffe066';
+        ctx.beginPath();
+        ctx.arc(barrel + 8, 0, 9, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+    ctx.restore();
+  }
+
+  function drawLandFish() {
+    var list = G.island.fish;
+    for (var i = 0; i < list.length; i++) {
+      var o = list[i];
+      var size = o.size;
+      ctx.save();
+      ctx.translate(o.x, o.y);
+
+      // 影子
+      ctx.fillStyle = 'rgba(0,0,0,0.22)';
+      ctx.beginPath();
+      ctx.ellipse(0, GROUND_Y - o.y, size * 0.5, 4, 0, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.rotate(o.ko ? 0 : o.rot);
+
+      var col = o.flash > 0.3 ? '#ffffff' : o.def.color;
+      ctx.fillStyle = col;
+      ctx.shadowColor = o.def.color;
+      ctx.shadowBlur = o.ko ? 4 : 14;
+
+      // 身体
+      ctx.beginPath();
+      ctx.ellipse(0, 0, size * 0.6, size * 0.36, 0, 0, Math.PI * 2);
+      ctx.fill();
+
+      // 尾巴
+      ctx.beginPath();
+      ctx.moveTo(-size * 0.55, 0);
+      ctx.lineTo(-size * 0.95, -size * 0.3);
+      ctx.lineTo(-size * 0.95, size * 0.3);
+      ctx.closePath();
+      ctx.fill();
+
+      ctx.shadowBlur = 0;
+      // 眼睛
+      if (o.ko) {
+        ctx.strokeStyle = '#22232c';
+        ctx.lineWidth = 1.6;
+        var ex = size * 0.3, ey = -size * 0.08;
+        ctx.beginPath();
+        ctx.moveTo(ex - 3, ey - 3); ctx.lineTo(ex + 3, ey + 3);
+        ctx.moveTo(ex + 3, ey - 3); ctx.lineTo(ex - 3, ey + 3);
+        ctx.stroke();
+      } else {
+        ctx.fillStyle = '#ffffff';
+        ctx.beginPath(); ctx.arc(size * 0.3, -size * 0.08, size * 0.11, 0, Math.PI * 2); ctx.fill();
+        ctx.fillStyle = '#15161c';
+        ctx.beginPath(); ctx.arc(size * 0.32, -size * 0.08, size * 0.06, 0, Math.PI * 2); ctx.fill();
+      }
+      ctx.restore();
+
+      // 血条
+      if (!o.ko && o.hp < o.maxHp) {
+        var bw = size * 1.1;
+        ctx.fillStyle = 'rgba(0,0,0,0.45)';
+        ctx.fillRect(o.x - bw / 2, o.y - size * 0.75, bw, 4);
+        ctx.fillStyle = '#7dffa8';
+        ctx.fillRect(o.x - bw / 2, o.y - size * 0.75, bw * (o.hp / o.maxHp), 4);
+      }
+
+      // 眩晕星星
+      if (o.ko) {
+        for (var s = 0; s < 3; s++) {
+          var a = G.t * 3 + s * 2.09;
+          ctx.fillStyle = '#ffe066';
+          ctx.beginPath();
+          ctx.arc(o.x + Math.cos(a) * 12, o.y - size * 0.7 + Math.sin(a) * 4, 2.4, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      }
+    }
+  }
+
+  function drawGulls() {
+    var gs = G.island.gulls;
+    for (var i = 0; i < gs.length; i++) {
+      var gu = gs[i];
+      ctx.save();
+      ctx.translate(gu.x, gu.y);
+      var flap = Math.sin(gu.wing) * 10;
+      ctx.strokeStyle = gu.flash > 0.3 ? '#ffffff' : '#f2f5ff';
+      ctx.fillStyle = gu.flash > 0.3 ? '#ffffff' : '#f2f5ff';
+      ctx.lineWidth = 4;
+      ctx.lineCap = 'round';
+      ctx.beginPath();
+      ctx.moveTo(-14, flap * 0.5);
+      ctx.lineTo(0, 0);
+      ctx.lineTo(14, flap * 0.5);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.ellipse(0, 0, 11, 6, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#ffb03a';
+      ctx.beginPath();
+      ctx.moveTo(11, -1); ctx.lineTo(20, 2); ctx.lineTo(11, 4);
+      ctx.closePath(); ctx.fill();
+      ctx.fillStyle = '#15161c';
+      ctx.beginPath(); ctx.arc(6, -2, 1.6, 0, Math.PI * 2); ctx.fill();
+      ctx.restore();
+    }
+  }
+
+  function drawBoss() {
+    var b = G.island.boss;
+    if (!b) return;
+    var style = BOSS_STYLE[b.name] || { color: '#ff5f5f', accent: '#ffb0b0' };
+
+    ctx.save();
+    ctx.translate(b.x, b.y);
+
+    if (b.spawnT > 0) {
+      ctx.globalAlpha = 1 - b.spawnT / 1.6;
+      ctx.translate(0, b.spawnT * 90);
+    }
+
+    var col = b.flash > 0.3 ? '#ffffff' : style.color;
+
+    // 影子
+    ctx.fillStyle = 'rgba(0,0,0,0.3)';
+    ctx.beginPath();
+    ctx.ellipse(0, 4, b.w * 0.5, 12, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    // 腿 / 刺
+    if (style.legs) {
+      ctx.strokeStyle = col;
+      ctx.lineWidth = 9;
+      ctx.lineCap = 'round';
+      for (var i = -2; i <= 2; i++) {
+        if (i === 0) continue;
+        var lx = i * 26;
+        var lp = Math.sin(G.t * 6 + i) * 6;
+        ctx.beginPath();
+        ctx.moveTo(lx * 0.5, -30);
+        ctx.lineTo(lx, -6 + lp);
+        ctx.lineTo(lx + i * 8, 2);
+        ctx.stroke();
+      }
+    }
+    if (style.spikes) {
+      ctx.fillStyle = col;
+      for (var s = 0; s < 10; s++) {
+        var a = (s / 10) * Math.PI * 2 + b.rot * 0.4;
+        ctx.beginPath();
+        ctx.moveTo(Math.cos(a) * b.w * 0.42, -b.h * 0.5 + Math.sin(a) * b.h * 0.42);
+        ctx.lineTo(Math.cos(a) * b.w * 0.62, -b.h * 0.5 + Math.sin(a) * b.h * 0.62);
+        ctx.lineTo(Math.cos(a + 0.18) * b.w * 0.42, -b.h * 0.5 + Math.sin(a + 0.18) * b.h * 0.42);
+        ctx.closePath();
+        ctx.fill();
+      }
+    }
+
+    // 身体
+    ctx.fillStyle = col;
+    ctx.shadowColor = style.color;
+    ctx.shadowBlur = 26;
+    ctx.beginPath();
+    ctx.ellipse(0, -b.h * 0.5, b.w * 0.5, b.h * 0.5, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.shadowBlur = 0;
+
+    // 眼睛
+    var ex = b.dir > 0 ? 22 : -22;
+    ctx.fillStyle = '#ffffff';
+    ctx.beginPath(); ctx.arc(ex - 12, -b.h * 0.62, 13, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(ex + 12, -b.h * 0.62, 13, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = '#15161c';
+    ctx.beginPath(); ctx.arc(ex - 12 + b.dir * 4, -b.h * 0.62, 6, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(ex + 12 + b.dir * 4, -b.h * 0.62, 6, 0, Math.PI * 2); ctx.fill();
+
+    // 嘴
+    ctx.fillStyle = '#2a1018';
+    ctx.beginPath();
+    ctx.ellipse(ex, -b.h * 0.34, 20, 8 + Math.sin(G.t * 4) * 3, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    // 蓄力提示
+    if (b.phase === 'charge' && b.phaseT > 0) {
+      ctx.strokeStyle = 'rgba(255,80,80,' + (0.4 + Math.sin(G.t * 30) * 0.3) + ')';
+      ctx.lineWidth = 4;
+      ctx.beginPath();
+      ctx.arc(0, -b.h * 0.5, b.w * 0.75, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+
+    ctx.restore();
+  }
+
+  function drawBullets() {
+    var list = G.island.bullets;
+    for (var i = 0; i < list.length; i++) {
+      var b = list[i];
+      ctx.save();
+      ctx.shadowColor = '#ffe066';
+      ctx.shadowBlur = 10;
+      ctx.fillStyle = '#fff4c0';
+      ctx.beginPath();
+      ctx.arc(b.x, b.y, b.r, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
+    var eb = G.island.eballs;
+    for (var j = 0; j < eb.length; j++) {
+      var e = eb[j];
+      ctx.save();
+      ctx.shadowColor = '#ff5f8a';
+      ctx.shadowBlur = 14;
+      ctx.fillStyle = '#ff5f8a';
+      ctx.beginPath();
+      ctx.arc(e.x, e.y, e.r, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#ffd0e0';
+      ctx.beginPath();
+      ctx.arc(e.x, e.y, e.r * 0.45, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
+  }
+
+  function drawParts() {
+    var list = G.island.parts;
+    for (var i = 0; i < list.length; i++) {
+      var p = list[i];
+      var k = 1 - p.life / p.maxLife;
+      ctx.globalAlpha = k;
+      ctx.fillStyle = p.color;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.size * k + 0.4, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    var ts = G.island.texts;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    for (var j = 0; j < ts.length; j++) {
+      var tx = ts[j];
+      var a = 1 - tx.life / tx.maxLife;
+      ctx.globalAlpha = a;
+      ctx.font = 'bold 18px ' + MONO;
+      ctx.fillStyle = tx.color;
+      ctx.fillText(tx.text, tx.x, tx.y);
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function drawHUD() {
+    ctx.save();
+    ctx.textBaseline = 'top';
+
+    // 钱
+    ctx.textAlign = 'left';
+    ctx.fillStyle = '#ffe066';
+    ctx.font = 'bold 26px ' + MONO;
+    ctx.fillText('¥' + player.money, 20, 16);
+
+    ctx.fillStyle = 'rgba(200,220,240,0.6)';
+    ctx.font = '12px ' + MONO;
+    ctx.fillText('武器: ' + WEAPONS[player.weapon].name + '   鱼竿 Lv.' + player.rodLevel, 21, 48);
+
+    // 生命
+    for (var i = 0; i < player.maxHp; i++) {
+      var hx = 20 + i * 26, hy = 74;
+      ctx.fillStyle = i < player.hp ? '#ff5f7a' : 'rgba(255,255,255,0.14)';
+      ctx.shadowColor = '#ff5f7a';
+      ctx.shadowBlur = i < player.hp ? 10 : 0;
+      ctx.beginPath(); ctx.arc(hx + 8, hy + 6, 8, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.shadowBlur = 0;
+
+    // 岛 + 进度
+    ctx.textAlign = 'center';
+    ctx.fillStyle = 'rgba(230,240,255,0.92)';
+    ctx.font = 'bold 17px ' + MONO;
+    ctx.fillText('第 ' + (G.island.idx + 1) + ' 岛 · ' + ISLANDS[G.island.idx].name, LW / 2, 18);
+
+    ctx.font = '13px ' + MONO;
+    ctx.fillStyle = 'rgba(190,215,240,0.85)';
+    ctx.fillText('鱼获 ' + G.island.caught + ' / ' + G.island.goal + '   —— 装满就开 BOSS', LW / 2, 42);
+
+    var pw = 220, px = LW / 2 - pw / 2, py = 64;
+    ctx.fillStyle = 'rgba(255,255,255,0.14)';
+    ctx.fillRect(px, py, pw, 6);
+    ctx.fillStyle = '#7dffa8';
+    ctx.fillRect(px, py, pw * clamp(G.island.caught / G.island.goal, 0, 1), 6);
+
+    // 提示
+    ctx.textAlign = 'left';
+    ctx.fillStyle = 'rgba(190,215,240,0.55)';
+    ctx.font = '12px ' + MONO;
+    ctx.fillText('空格 抛竿/收线   左键 攻击   A/D 走   B 商店   R 清卡壳', 20, LH - 26);
+
+    if (G.quipT < 5) {
+      ctx.globalAlpha = clamp(G.quipT / 1.2, 0, 1) * 0.7;
+      ctx.textAlign = 'right';
+      ctx.fillStyle = '#9fd8ff';
+      ctx.font = '13px ' + MONO;
+      ctx.fillText(G.quip, LW - 20, LH - 26);
+      ctx.globalAlpha = 1;
+    }
+
+    // 消息
+    if (G.msgT > 0) {
+      ctx.globalAlpha = clamp(G.msgT / 0.5, 0, 1);
+      ctx.textAlign = 'center';
+      ctx.font = 'bold 24px ' + MONO;
+      ctx.fillStyle = '#ffe066';
+      ctx.shadowColor = '#000'; ctx.shadowBlur = 8;
+      ctx.fillText(G.msg, LW / 2, 110);
+      ctx.shadowBlur = 0;
+      ctx.globalAlpha = 1;
+    }
+
+    // 卡壳
+    if (G.jammed > 0) {
+      ctx.textAlign = 'center';
+      ctx.font = 'bold 22px ' + MONO;
+      ctx.fillStyle = '#ff5f5f';
+      ctx.fillText('卡壳！ 按 R', LW / 2, 150);
+    }
+
+    // 鱼竿张力条
+    if (fish.state === 'reeling' || fish.state === 'bite') {
+      var bx = LW / 2 - 150, by = LH - 110, bw = 300, bh = 18;
+      ctx.fillStyle = 'rgba(0,0,0,0.55)';
+      roundRect(bx - 3, by - 3, bw + 6, bh + 6, 6);
+      ctx.fill();
+
+      ctx.fillStyle = 'rgba(255,255,255,0.15)';
+      ctx.fillRect(bx, by, bw, bh);
+
+      var tcol = fish.tension > 0.8 ? '#ff4d4d' : (fish.tension > 0.55 ? '#ffb03a' : '#5fe08a');
+      ctx.fillStyle = tcol;
+      ctx.fillRect(bx, by, bw * clamp(fish.tension, 0, 1), bh);
+
+      // 安全区提示
+      ctx.strokeStyle = 'rgba(255,255,255,0.5)';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(bx + bw * 0.82, by);
+      ctx.lineTo(bx + bw * 0.82, by + bh);
+      ctx.stroke();
+
+      ctx.fillStyle = 'rgba(230,240,255,0.9)';
+      ctx.font = 'bold 12px ' + MONO;
+      ctx.textAlign = 'center';
+      ctx.fillText('张力（松手会降）', bx + bw / 2, by - 22);
+
+      // 收线进度
+      ctx.fillStyle = 'rgba(0,0,0,0.55)';
+      roundRect(bx - 3, by + bh + 8, bw + 6, 12, 5);
+      ctx.fill();
+      ctx.fillStyle = '#5fd0ff';
+      ctx.fillRect(bx, by + bh + 11, bw * clamp(fish.progress, 0, 1), 6);
+    }
+
+    // BOSS 血条
+    var b = G.island.boss;
+    if (b && !b.dead && b.spawnT <= 0) {
+      var w2 = 520, x2 = LW / 2 - w2 / 2, y2 = LH - 62;
+      ctx.fillStyle = 'rgba(0,0,0,0.6)';
+      roundRect(x2 - 4, y2 - 4, w2 + 8, 26, 6);
+      ctx.fill();
+      ctx.fillStyle = 'rgba(255,255,255,0.13)';
+      ctx.fillRect(x2, y2, w2, 18);
+      ctx.fillStyle = '#ff4d6d';
+      ctx.fillRect(x2, y2, w2 * clamp(b.hp / b.maxHp, 0, 1), 18);
+      ctx.fillStyle = '#fff';
+      ctx.font = 'bold 14px ' + MONO;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(b.name + '   ' + Math.ceil(b.hp) + ' / ' + b.maxHp, LW / 2, y2 + 9);
+      ctx.textBaseline = 'top';
+    }
+
+    ctx.restore();
+  }
+
+  function drawShop() {
+    ctx.save();
+    ctx.fillStyle = 'rgba(4,6,14,0.82)';
+    ctx.fillRect(0, 0, LW, LH);
+
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'top';
+    ctx.fillStyle = '#ffe066';
+    ctx.font = 'bold 34px ' + MONO;
+    ctx.fillText('商 店', LW / 2, 52);
+    ctx.font = '15px ' + MONO;
+    ctx.fillStyle = 'rgba(200,220,240,0.8)';
+    ctx.fillText('当前 ¥' + player.money + '   ——   按数字键购买，B 关闭', LW / 2, 96);
+
+    var y0 = 150;
+    for (var i = 0; i < SHOP.length; i++) {
+      var it = SHOP[i];
+      var owned = false, maxed = false;
+      if (it.kind === 'weapon' && player.weapon >= it.idx) owned = true;
+      if (it.kind === 'rod' && player.rodLevel >= 3) maxed = true;
+      if (it.kind === 'hp' && player.maxHp >= 6) maxed = true;
+      var afford = player.money >= it.cost;
+
+      var y = y0 + i * 46;
+      ctx.fillStyle = (owned || maxed) ? 'rgba(80,100,120,0.35)' : (afford ? 'rgba(60,110,90,0.45)' : 'rgba(90,50,60,0.35)');
+      roundRect(LW / 2 - 260, y, 520, 38, 8);
+      ctx.fill();
+
+      ctx.textAlign = 'left';
+      ctx.font = 'bold 19px ' + MONO;
+      ctx.fillStyle = (owned || maxed) ? 'rgba(180,195,210,0.6)' : '#eaf6ff';
+      ctx.fillText('[' + it.key + ']  ' + it.label, LW / 2 - 240, y + 9);
+
+      ctx.textAlign = 'right';
+      ctx.fillStyle = (owned || maxed) ? 'rgba(180,195,210,0.6)' : (afford ? '#7dffa8' : '#ff8a9a');
+      ctx.fillText((owned || maxed) ? (owned ? '已拥有' : '已满级') : '¥' + it.cost, LW / 2 + 240, y + 9);
+    }
+
+    ctx.textAlign = 'center';
+    ctx.font = '13px ' + MONO;
+    ctx.fillStyle = 'rgba(180,205,230,0.6)';
+    ctx.fillText('鱼竿升级：不容易断线，收线更快    生命上限：+1 颗心', LW / 2, LH - 70);
+    ctx.fillText('提示：大鱼会撞人，远距离用枪更安全', LW / 2, LH - 46);
+    ctx.restore();
+  }
+
+  function drawCenterPanel() {
+    ctx.save();
+    ctx.fillStyle = 'rgba(4,6,14,0.72)';
+    ctx.fillRect(0, 0, LW, LH);
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+
+    if (G.mode === 'menu') {
+      ctx.font = 'bold 60px ' + MONO;
+      ctx.fillStyle = '#eaf9ff';
+      ctx.shadowColor = '#ffb03a';
+      ctx.shadowBlur = 30;
+      ctx.fillText('渔 力 全 开', LW / 2, 130);
+      ctx.shadowBlur = 0;
+      ctx.font = '14px ' + MONO;
+      ctx.fillStyle = 'rgba(180,210,240,0.8)';
+      ctx.fillText('2D 单机致敬版 · How to Fish', LW / 2, 178);
+
+      var pulse = 0.55 + Math.sin(G.t * 3.4) * 0.35;
+      ctx.globalAlpha = pulse;
+      ctx.font = 'bold 22px ' + MONO;
+      ctx.fillStyle = '#ffe066';
+      ctx.fillText('点击开始（从第 ' + (save.unlocked + 1) + ' 岛）', LW / 2, 250);
+      ctx.globalAlpha = 1;
+
+      ctx.font = '15px ' + MONO;
+      ctx.fillStyle = 'rgba(200,225,250,0.85)';
+      ctx.fillText('空格 抛竿 / 收线     左键 打鱼     A D 走', LW / 2, 320);
+      ctx.fillText('B 商店     R 清卡壳', LW / 2, 348);
+      ctx.fillStyle = 'rgba(255,180,120,0.9)';
+      ctx.fillText('鱼钓上来会变成疯鱼 —— 打晕它，再捡起来卖钱。', LW / 2, 400);
+      ctx.fillText('别让它蹦回海里。也小心海鸥。', LW / 2, 424);
+    } else if (G.mode === 'shop') {
+      drawShop();
+    } else if (G.mode === 'paused') {
+      ctx.font = 'bold 42px ' + MONO;
+      ctx.fillStyle = '#eaf9ff';
+      ctx.fillText('已 暂 停', LW / 2, LH / 2 - 20);
+      ctx.font = '15px ' + MONO;
+      ctx.fillStyle = 'rgba(180,210,240,0.85)';
+      ctx.fillText('按 P 继续', LW / 2, LH / 2 + 30);
+    } else if (G.mode === 'islandClear') {
+      ctx.font = 'bold 50px ' + MONO;
+      ctx.fillStyle = '#7dffa8';
+      ctx.shadowColor = '#7dffa8'; ctx.shadowBlur = 26;
+      ctx.fillText('岛屿通关', LW / 2, LH / 2 - 80);
+      ctx.shadowBlur = 0;
+      ctx.font = 'bold 22px ' + MONO;
+      ctx.fillStyle = '#eaf9ff';
+      ctx.fillText(ISLANDS[G.island.idx].boss + ' 被打趴了。', LW / 2, LH / 2 - 20);
+      ctx.font = '16px ' + MONO;
+      ctx.fillStyle = 'rgba(200,225,250,0.9)';
+      ctx.fillText('累计鱼获 ' + G.totalCaught + ' 条    晕倒 ' + G.deaths + ' 次    身家 ¥' + player.money, LW / 2, LH / 2 + 30);
+
+      if (G.island.idx + 1 < ISLANDS.length) {
+        var p2 = 0.55 + Math.sin(G.t * 3.4) * 0.35;
+        ctx.globalAlpha = p2;
+        ctx.font = 'bold 20px ' + MONO;
+        ctx.fillStyle = '#ffe066';
+        ctx.fillText('点击 / 空格 —— 前往下一座岛', LW / 2, LH / 2 + 110);
+        ctx.globalAlpha = 1;
+      } else {
+        ctx.font = 'bold 26px ' + MONO;
+        ctx.fillStyle = '#ffe066';
+        ctx.fillText('全部通关！你带着酒和鱼回家了。', LW / 2, LH / 2 + 100);
+        ctx.font = '16px ' + MONO;
+        ctx.fillStyle = 'rgba(200,225,250,0.85)';
+        ctx.fillText('按 R 重开', LW / 2, LH / 2 + 140);
+      }
+    }
+    ctx.restore();
+  }
+
+  function draw() {
+    screenTransform();
+    ctx.fillStyle = '#04050c';
+    ctx.fillRect(0, 0, W, H);
+
+    if (!G) return;
+    worldTransform();
+
+    ctx.save();
+    if (G.shake > 0.1) ctx.translate((Math.random() - 0.5) * G.shake, (Math.random() - 0.5) * G.shake);
+
+    drawBackground();
+    drawUnderwaterFish();
+    drawLandFish();
+    drawBoss();
+    drawGulls();
+    drawBullets();
+    if (G.mode !== 'menu') drawFishingLine();
+    drawPlayer();
+    drawParts();
+
+    ctx.restore();
+
+    if (G.flash > 0) {
+      ctx.fillStyle = 'rgba(255,60,90,' + (G.flash * 0.4) + ')';
+      ctx.fillRect(0, 0, LW, LH);
+    }
+
+    if (G.mode === 'playing') {
+      drawHUD();
+      if (G.island.bossIntro > 0) {
+        ctx.save();
+        ctx.globalAlpha = clamp(G.island.bossIntro / 0.6, 0, 1);
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.font = 'bold 40px ' + MONO;
+        ctx.fillStyle = '#ff5f5f';
+        ctx.shadowColor = '#ff3b5c'; ctx.shadowBlur = 24;
+        ctx.fillText('警 报', LW / 2, LH * 0.4);
+        ctx.font = 'bold 24px ' + MONO;
+        ctx.fillStyle = '#ffe066';
+        ctx.fillText(ISLANDS[G.island.idx].boss + ' 上岸了', LW / 2, LH * 0.4 + 46);
+        ctx.restore();
+      }
+    } else if (G.mode === 'paused') {
+      drawHUD();
+      drawCenterPanel();
+    } else {
+      drawCenterPanel();
+    }
+  }
+
+  /* ============================================================ 输入 */
+
+  function startOrContinue() {
+    audioInit();
+    if (G.mode === 'menu') {
+      G.mode = 'playing';
+      if (save.unlocked > 0 && save.unlocked < ISLANDS.length) {
+        G.island = newIsland(save.unlocked);
+        say('从第 ' + (save.unlocked + 1) + ' 岛继续。', 2.0);
+      }
+      return true;
+    }
+    if (G.mode === 'islandClear') {
+      if (G.island.idx + 1 < ISLANDS.length) {
+        G.island = newIsland(G.island.idx + 1);
+        G.mode = 'playing';
+        G.clearT = 0;
+        say('抵达 ' + ISLANDS[G.island.idx].name, 2.0);
+      }
+      return true;
+    }
+    return false;
+  }
+
+  window.addEventListener('pointermove', function (ev) {
+    var p = toWorld(ev.clientX, ev.clientY);
+    mouse.x = p.x; mouse.y = p.y;
+  });
+
+  window.addEventListener('pointerdown', function (ev) {
+    audioInit();
+    var p = toWorld(ev.clientX, ev.clientY);
+    mouse.x = p.x; mouse.y = p.y;
+    mouse.down = true;
+    if (G.mode === 'menu' || G.mode === 'islandClear') { startOrContinue(); return; }
+    if (G.mode === 'playing') attack();
+    if (G.jammed > 0) { G.jammed = 0; say('上膛！', 0.8); }
+  });
+
+  window.addEventListener('pointerup', function () { mouse.down = false; });
+
+  window.addEventListener('keydown', function (ev) {
+    var k = ev.key.toLowerCase();
+    keys[k] = true;
+    audioInit();
+
+    if (k === ' ' || k === 'spacebar') {
+      ev.preventDefault();
+      if (G.mode !== 'playing') startOrContinue();
+      return;
+    }
+    if (k === 'b') {
+      if (G.mode === 'playing') G.mode = 'shop';
+      else if (G.mode === 'shop') G.mode = 'playing';
+      return;
+    }
+    if (k === 'p' || k === 'escape') {
+      if (G.mode === 'playing') G.mode = 'paused';
+      else if (G.mode === 'paused') G.mode = 'playing';
+      return;
+    }
+    if (k === 'm') { soundOn = !soundOn; return; }
+    if (k === 'r') {
+      if (G.mode === 'playing') { G.jammed = 0; }
+      return;
+    }
+    if (G.mode === 'shop') {
+      for (var i = 0; i < SHOP.length; i++) {
+        if (SHOP[i].key === k) { tryBuy(SHOP[i]); return; }
+      }
+    }
+    if (k.indexOf('arrow') === 0) ev.preventDefault();
+  });
+
+  window.addEventListener('keyup', function (ev) {
+    keys[ev.key.toLowerCase()] = false;
+  });
+
+  window.addEventListener('blur', function () {
+    keys = Object.create(null);
+    if (G && G.mode === 'playing') G.mode = 'paused';
+  });
+
+  window.addEventListener('resize', resize);
+
+  /* ============================================================ 主循环 */
+
+  var last = 0;
+  function frame(now) {
+    if (!last) last = now;
+    var dt = (now - last) / 1000;
+    last = now;
+    if (dt > 0.05) dt = 0.05;
+    if (dt < 0) dt = 0;
+    update(dt);
+    draw();
+    requestAnimationFrame(frame);
+  }
+
+  resize();
+  newGame();
+  G.mode = 'menu';
+  G.quipT = 8;
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
